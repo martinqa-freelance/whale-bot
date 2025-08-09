@@ -10,25 +10,32 @@ WH_WHALE = os.getenv("WH_WHALE")          # webhook pro #whale-alerts
 WH_WATCH = os.getenv("WH_WATCH")          # webhook pro #watchlist-alerts
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", WH_WHALE)  # fallback: když nemáš DISCORD_WEBHOOK, použijeme WH_WHALE
 THRESH_SOL = float(os.getenv("THRESH_SOL", "500"))
+"""
 
+watchlist / alert-bot. bot.py - main branch / github """
 # --- watchlist ---
 WATCHLIST = set()
 if os.path.exists("watchlist.txt"):
     with open("watchlist.txt", "r", encoding="utf-8") as f:
         WATCHLIST = {x.strip() for x in f if x.strip()}
 
-# --- helpers ---
-def send_to_discord(message: str, webhook: str = None):
-    url = webhook or DISCORD_WEBHOOK
+# --- helpers (replace) ---
+def _send(message: str, url: str, env_name: str):
     if not url:
-        print("⚠️ Žádný Discord webhook (WH_WHALE/ DISCORD_WEBHOOK) není nastaven.")
+        print(f"⚠️ Chybí {env_name} (Discord webhook).")
         return
     try:
         r = requests.post(url, json={"content": message}, timeout=10)
         if r.status_code >= 300:
-            print(f"❌ Discord webhook error {r.status_code}: {r.text}")
+            print(f"❌ Discord {env_name} error {r.status_code}: {r.text}")
     except Exception as e:
-        print(f"❌ Chyba při odesílání do Discordu: {e}")
+        print(f"❌ Chyba při odesílání do Discordu ({env_name}): {e}")
+
+def send_whale(message: str):
+    _send(message, WH_WHALE, "WH_WHALE")
+
+def send_watch(message: str):
+    _send(message, WH_WATCH, "WH_WATCH")
 
 def get_number(x, *keys, default=0):
     """Bezpečně vytáhne číslo z nested dictu i z plain int; vrací float."""
@@ -51,57 +58,60 @@ def get_number(x, *keys, default=0):
     return float(default)
 
 def parse_and_alert(tx: dict):
-    """
-    Očekává Helius Enhanced webhook objekt jedné transakce:
-      tx["type"] == "SWAP"
-      tx["events"]["swap"] {...}
-    """
+    # jen SWAP
     tx_type = (tx.get("type") or "").upper()
     if tx_type != "SWAP":
-        return  # ignorujeme ostatní
+        return
 
     swap = (tx.get("events") or {}).get("swap") or {}
-    # SOL utracené za nákup (lamports → SOL)
-    lamports_in = get_number(swap, "nativeInput", default=0.0)
+
+    # lamports → SOL (safe)
+    lamports_in  = get_number(swap, "nativeInput",  default=0.0)
     lamports_out = get_number(swap, "nativeOutput", default=0.0)
     lamports = lamports_in if lamports_in > 0 else abs(lamports_out)
     sol_spent = lamports / 1_000_000_000.0
 
-    if sol_spent <= 0:
-        return
-
-    buyer = (tx.get("accountData") or [{}])[0].get("account", {}).get("pubkey", None)
-    token_mint = (swap.get("tokenOutput") or {}).get("mint") or (swap.get("tokenInput") or {}).get("mint") or "UNKNOWN"
+    # identita a token
+    buyer = ((tx.get("accountData") or [{}])[0].get("account") or {}).get("pubkey")
+    token_mint = (
+        (swap.get("tokenOutput") or {}).get("mint")
+        or (swap.get("tokenInput") or {}).get("mint")
+        or "UNKNOWN"
+    )
     sig = tx.get("signature", "N/A")
 
-    # kanál
-    is_watch = buyer in WATCHLIST if buyer else False
-    is_whale = sol_spent >= THRESH_SOL
+    # watch/whale logika
+    non_sol = sol_spent <= 0  # spousta swapů je USDC→token
+    is_watch = (buyer in WATCHLIST) if buyer else False
+    is_whale = (sol_spent >= THRESH_SOL)
 
-    if not (is_watch or is_whale):
-        return  # pod prahem a není ve watchlistu
+    if not (is_watch or is_whale or non_sol):
+        # nic neposíláme
+        return
 
     # zpráva
     dex_url = f"https://dexscreener.com/solana/{token_mint}" if token_mint != "UNKNOWN" else "https://dexscreener.com/solana"
     solscan_url = f"https://solscan.io/tx/{sig}"
+    tag = " (non-SOL swap)" if non_sol else ""
     msg = (
-        f"🐋 **Whale SWAP**\n"
+        f"🐋 **Whale SWAP{tag}**\n"
         f"**BUY:** {sol_spent:.2f} SOL → `{token_mint}`\n"
         f"🔗 **Tx:** {solscan_url}\n"
         f"🔥 **DexScreener:** {dex_url}"
     )
 
-    if is_watch and WH_WATCH:
-        send_to_discord(msg, WH_WATCH)
-    if is_whale and WH_WHALE:
-        send_to_discord(msg, WH_WHALE)
-    elif not WH_WHALE:
-        # kdyby nebyl WH_WHALE, pošleme aspoň na fallback
-        send_to_discord(msg)
+    # odeslání – až teď!
+    if is_watch:
+        send_watch(msg)
+    if is_whale or (non_sol and not is_watch):  # ať aspoň něco vidíme u non-SOL testů
+        send_whale(msg)
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+
 
 @app.post("/hook")
 async def hook(req: Request):
