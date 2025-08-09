@@ -111,6 +111,15 @@ def health():
     return {"ok": True}
 
 
+@app.get("/ping/whale")
+def ping_whale():
+    send_whale("✅ Ping: WHALE webhook OK")
+    return {"ok": True}
+
+@app.get("/ping/watch")
+def ping_watch():
+    send_watch("✅ Ping: WATCH webhook OK")
+    return {"ok": True}
 
 
 @app.post("/hook")
