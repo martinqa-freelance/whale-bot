@@ -5,90 +5,123 @@ import uvicorn
 
 app = FastAPI()
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
-MIN_SOL = 500  # filtr — jen velké obchody
+# --- ENV ---
+WH_WHALE = os.getenv("WH_WHALE")          # webhook pro #whale-alerts
+WH_WATCH = os.getenv("WH_WATCH")          # webhook pro #watchlist-alerts
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", WH_WHALE)  # fallback: když nemáš DISCORD_WEBHOOK, použijeme WH_WHALE
+THRESH_SOL = float(os.getenv("THRESH_SOL", "500"))
 
-def send_to_discord(message: str):
-    if not DISCORD_WEBHOOK:
-        print("⚠️ Chybí DISCORD_WEBHOOK v .env")
+# --- watchlist ---
+WATCHLIST = set()
+if os.path.exists("watchlist.txt"):
+    with open("watchlist.txt", "r", encoding="utf-8") as f:
+        WATCHLIST = {x.strip() for x in f if x.strip()}
+
+# --- helpers ---
+def send_to_discord(message: str, webhook: str = None):
+    url = webhook or DISCORD_WEBHOOK
+    if not url:
+        print("⚠️ Žádný Discord webhook (WH_WHALE/ DISCORD_WEBHOOK) není nastaven.")
         return
     try:
-        requests.post(DISCORD_WEBHOOK, json={"content": message})
+        r = requests.post(url, json={"content": message}, timeout=10)
+        if r.status_code >= 300:
+            print(f"❌ Discord webhook error {r.status_code}: {r.text}")
     except Exception as e:
         print(f"❌ Chyba při odesílání do Discordu: {e}")
 
-def safe_get(d, *keys, default=None):
-    """Bezpečné získání hodnoty z vnořeného dictu"""
-    for k in keys:
-        if isinstance(d, dict) and k in d:
-            d = d[k]
-        else:
-            return default
-    return d
+def get_number(x, *keys, default=0):
+    """Bezpečně vytáhne číslo z nested dictu i z plain int; vrací float."""
+    if keys:
+        for k in keys:
+            if isinstance(x, dict):
+                x = x.get(k)
+            else:
+                x = None
+                break
+    # teď x může být dict/int/float/None
+    if isinstance(x, dict):
+        # typicky {"amount": <int>} nebo {"token": <int>}
+        for cand in ("amount", "token", "usd", "lamports"):
+            if cand in x and isinstance(x[cand], (int, float)):
+                return float(x[cand])
+        return float(default)
+    if isinstance(x, (int, float)):
+        return float(x)
+    return float(default)
 
-def parse_swap(event):
-    try:
-        from_token = safe_get(event, "sourceMint") or "Unknown"
-        to_token = safe_get(event, "destinationMint") or "Unknown"
+def parse_and_alert(tx: dict):
+    """
+    Očekává Helius Enhanced webhook objekt jedné transakce:
+      tx["type"] == "SWAP"
+      tx["events"]["swap"] {...}
+    """
+    tx_type = (tx.get("type") or "").upper()
+    if tx_type != "SWAP":
+        return  # ignorujeme ostatní
 
-        sol_amount = safe_get(event, "nativeInput", "amount") or 0
-        sol_amount /= 1e9  # lamports → SOL
+    swap = (tx.get("events") or {}).get("swap") or {}
+    # SOL utracené za nákup (lamports → SOL)
+    lamports_in = get_number(swap, "nativeInput", default=0.0)
+    lamports_out = get_number(swap, "nativeOutput", default=0.0)
+    lamports = lamports_in if lamports_in > 0 else abs(lamports_out)
+    sol_spent = lamports / 1_000_000_000.0
 
-        # filtr na velké obchody
-        if sol_amount < MIN_SOL:
-            return None
+    if sol_spent <= 0:
+        return
 
-        tx_hash = safe_get(event, "signature", default="N/A")
-        return f"🐋 **Whale SWAP**: {sol_amount:.2f} SOL → {to_token}\nTx: {tx_hash}"
+    buyer = (tx.get("accountData") or [{}])[0].get("account", {}).get("pubkey", None)
+    token_mint = (swap.get("tokenOutput") or {}).get("mint") or (swap.get("tokenInput") or {}).get("mint") or "UNKNOWN"
+    sig = tx.get("signature", "N/A")
 
-    except Exception as e:
-        print(f"parse_swap err: {e}")
-        return None
+    # kanál
+    is_watch = buyer in WATCHLIST if buyer else False
+    is_whale = sol_spent >= THRESH_SOL
 
-def parse_transfer(event):
-    try:
-        sol_amount = safe_get(event, "nativeAmount", "amount") or 0
-        sol_amount /= 1e9
+    if not (is_watch or is_whale):
+        return  # pod prahem a není ve watchlistu
 
-        if sol_amount < MIN_SOL:
-            return None
+    # zpráva
+    dex_url = f"https://dexscreener.com/solana/{token_mint}" if token_mint != "UNKNOWN" else "https://dexscreener.com/solana"
+    solscan_url = f"https://solscan.io/tx/{sig}"
+    msg = (
+        f"🐋 **Whale SWAP**\n"
+        f"**BUY:** {sol_spent:.2f} SOL → `{token_mint}`\n"
+        f"🔗 **Tx:** {solscan_url}\n"
+        f"🔥 **DexScreener:** {dex_url}"
+    )
 
-        sender = safe_get(event, "fromUserAccount") or "Unknown"
-        receiver = safe_get(event, "toUserAccount") or "Unknown"
-        tx_hash = safe_get(event, "signature", default="N/A")
+    if is_watch and WH_WATCH:
+        send_to_discord(msg, WH_WATCH)
+    if is_whale and WH_WHALE:
+        send_to_discord(msg, WH_WHALE)
+    elif not WH_WHALE:
+        # kdyby nebyl WH_WHALE, pošleme aspoň na fallback
+        send_to_discord(msg)
 
-        return f"💸 **Whale Transfer**: {sol_amount:.2f} SOL\nFrom: {sender}\nTo: {receiver}\nTx: {tx_hash}"
-    except Exception as e:
-        print(f"parse_transfer err: {e}")
-        return None
-
-def parse_helius(payload):
-    events = payload.get("events", [])
-    messages = []
-
-    for event in events:
-        event_type = event.get("type", "").upper()
-
-        if event_type == "SWAP":
-            msg = parse_swap(event)
-        elif event_type == "TRANSFER":
-            msg = parse_transfer(event)
-        else:
-            msg = None  # ignorujeme ostatní
-
-        if msg:
-            messages.append(msg)
-
-    return messages
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 @app.post("/hook")
-async def hook(request: Request):
-    payload = await request.json()
-    msgs = parse_helius(payload)
-    for m in msgs:
-        send_to_discord(m)
+async def hook(req: Request):
+    try:
+        body = await req.json()
+    except Exception as e:
+        print("❌ JSON parse error:", e)
+        return {"status": "bad json"}
+
+    # Helius někdy pošle pole; jindy jeden objekt
+    items = body if isinstance(body, list) else [body]
+    for tx in items:
+        try:
+            parse_and_alert(tx)
+        except Exception as e:
+            print("❌ parse_and_alert error:", e)
+            # nevracíme 500, ať Helius ne-retryuje donekonečna
+
     return {"status": "ok"}
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", "8080"))
     uvicorn.run(app, host="0.0.0.0", port=port)
