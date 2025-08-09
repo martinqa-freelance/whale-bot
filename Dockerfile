@@ -3,4 +3,5 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-CMD ["python","bot.py"]
+# Render předá proměnnou PORT, FastAPI musí poslouchat na 0.0.0.0
+CMD ["uvicorn","bot:app","--host","0.0.0.0","--port","${PORT}"]
