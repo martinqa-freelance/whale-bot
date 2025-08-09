@@ -1,136 +1,94 @@
-# bot.py
-import os, json, requests
+import os
+import requests
 from fastapi import FastAPI, Request
-from dotenv import load_dotenv
-
-load_dotenv()
-WH_WHALE = os.getenv("WH_WHALE")
-WH_WATCH = os.getenv("WH_WATCH")
-THRESH_SOL = float(os.getenv("THRESH_SOL", "500"))
-
-WATCHLIST = set()
-if os.path.exists("watchlist.txt"):
-    with open("watchlist.txt", "r", encoding="utf-8") as f:
-        WATCHLIST = {x.strip() for x in f if x.strip()}
+import uvicorn
 
 app = FastAPI()
 
-def send_embed(webhook, title, desc, color=5814783):
-    try:
-        requests.post(webhook, json={
-            "username":"WhaleCaster",
-            "embeds":[{"title":title,"description":desc,"color":color}]
-        }, timeout=10)
-    except Exception as e:
-        print("Discord error:", e)
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
+MIN_SOL = 500  # filtr — jen velké obchody
 
-def pct(a,b):
+def send_to_discord(message: str):
+    if not DISCORD_WEBHOOK:
+        print("⚠️ Chybí DISCORD_WEBHOOK v .env")
+        return
     try:
-        return round((b-a)/a*100, 2)
-    except Exception:
+        requests.post(DISCORD_WEBHOOK, json={"content": message})
+    except Exception as e:
+        print(f"❌ Chyba při odesílání do Discordu: {e}")
+
+def safe_get(d, *keys, default=None):
+    """Bezpečné získání hodnoty z vnořeného dictu"""
+    for k in keys:
+        if isinstance(d, dict) and k in d:
+            d = d[k]
+        else:
+            return default
+    return d
+
+def parse_swap(event):
+    try:
+        from_token = safe_get(event, "sourceMint") or "Unknown"
+        to_token = safe_get(event, "destinationMint") or "Unknown"
+
+        sol_amount = safe_get(event, "nativeInput", "amount") or 0
+        sol_amount /= 1e9  # lamports → SOL
+
+        # filtr na velké obchody
+        if sol_amount < MIN_SOL:
+            return None
+
+        tx_hash = safe_get(event, "signature", default="N/A")
+        return f"🐋 **Whale SWAP**: {sol_amount:.2f} SOL → {to_token}\nTx: {tx_hash}"
+
+    except Exception as e:
+        print(f"parse_swap err: {e}")
         return None
 
-def rating(liq_usd=None, mc_change_15m=None, vol_mult_5m=None, renounced=None, is_new=None):
-    tags = ["🐋"]
-    if mc_change_15m is not None and mc_change_15m >= 10 and (liq_usd or 0) >= 50000: tags.append("🚀")
-    if vol_mult_5m is not None and vol_mult_5m >= 3: tags.append("🔥")
-    if (liq_usd is not None and liq_usd < 15000) or (is_new and not renounced): tags.append("💩")
-    # unique
-    out, seen = [], set()
-    for x in tags:
-        if x not in seen: seen.add(x); out.append(x)
-    return " ".join(out)
-
-def parse_helius(payload: dict):
-    """
-    Helius Enhanced webhook (type: SWAP)
-    Pokusíme se vytáhnout:
-      - kupující wallet
-      - token mint/symbol (pokud je v logs) – symbol může být None, to nevadí
-      - amount v SOL (kolik SOL šlo ven za nákup)
-      - dex url / solscan url
-    """
-    # defaulty
-    buyer = None
-    token_mint = None
-    symbol = "UNKNOWN"
-    sol_spent = 0.0
-
-    # 1) zdrojová peněženka (většinou první signer)
+def parse_transfer(event):
     try:
-        buyer = payload["accountData"][0]["account"]["pubkey"]
-    except Exception:
-        pass
+        sol_amount = safe_get(event, "nativeAmount", "amount") or 0
+        sol_amount /= 1e9
 
-    # 2) swap event – Helius dává parsed swap
-    #   hledáme "nativeInput" nebo "nativeOutput" v lamport (1 SOL = 1e9)
-    try:
-        events = payload.get("events", {})
-        swap = events.get("swap", {})
-        # kolik SOL jsme utratili (nativeInput = SOL -> token)
-        lamports_in  = swap.get("nativeInput", 0) or 0
-        lamports_out = swap.get("nativeOutput", 0) or 0
-        if lamports_in:
-            sol_spent = lamports_in / 1_000_000_000
-        elif lamports_out and lamports_out < 0:  # bezpečnostní fallback
-            sol_spent = abs(lamports_out) / 1_000_000_000
+        if sol_amount < MIN_SOL:
+            return None
 
-        # cílový token mint
-        token_mint = (swap.get("tokenOutput", {}) or {}).get("mint")
-        if not token_mint:
-            token_mint = (swap.get("tokenInput", {}) or {}).get("mint")
+        sender = safe_get(event, "fromUserAccount") or "Unknown"
+        receiver = safe_get(event, "toUserAccount") or "Unknown"
+        tx_hash = safe_get(event, "signature", default="N/A")
 
+        return f"💸 **Whale Transfer**: {sol_amount:.2f} SOL\nFrom: {sender}\nTo: {receiver}\nTx: {tx_hash}"
     except Exception as e:
-        print("parse swap err:", e)
+        print(f"parse_transfer err: {e}")
+        return None
 
-    # Dex/Solscan odkazy
-    dex_url = f"https://dexscreener.com/solana/{token_mint}" if token_mint else "https://dexscreener.com/solana"
-    solscan_url = f"https://solscan.io/token/{token_mint}" if token_mint else "https://solscan.io/tx/"+payload.get("signature","")
+def parse_helius(payload):
+    events = payload.get("events", [])
+    messages = []
 
-    return buyer, token_mint, symbol, sol_spent, dex_url, solscan_url
+    for event in events:
+        event_type = event.get("type", "").upper()
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+        if event_type == "SWAP":
+            msg = parse_swap(event)
+        elif event_type == "TRANSFER":
+            msg = parse_transfer(event)
+        else:
+            msg = None  # ignorujeme ostatní
+
+        if msg:
+            messages.append(msg)
+
+    return messages
 
 @app.post("/hook")
-async def hook(req: Request):
-    body = await req.json()
-    # Helius umí poslat pole transakcí – pro jistotu bereme všechny
-    items = body if isinstance(body, list) else [body]
-
-    for tx in items:
-        # filtrujeme jen SWAP
-        if tx.get("type") != "SWAP":
-            continue
-
-        buyer, mint, symbol, sol_spent, dex_url, solscan_url = parse_helius(tx)
-        if not buyer or sol_spent <= 0:
-            continue
-
-        # prah pro whale channel
-        is_whale = sol_spent >= THRESH_SOL
-        is_watch = buyer in WATCHLIST
-
-        # (volitelně sem doplníme lookup holders/MC/LQ přes jiné API; teď placeholders)
-        holders = "?"
-        mc_usd  = "?"
-        lq_usd  = "?"
-
-        # rating (zatím bez market dat)
-        tags = rating()
-
-        desc = (
-            f"{tags} **Whale BUY Alert**\n"
-            f"**BUY:** {round(sol_spent,2)} SOL tokenu `{symbol}`\n"
-            f"🔗 **Adresa:** [Solscan]({solscan_url})\n"
-            f"👥 **Holders:** {holders} | **MC:** ${mc_usd} | **LQ:** ${lq_usd}\n"
-            f"🔥 **DexScreener:** {dex_url}\n"
-        )
-
-        if is_watch and WH_WATCH:
-            send_embed(WH_WATCH, "Watchlist BUY", desc)
-        if is_whale and WH_WHALE:
-            send_embed(WH_WHALE, "Whale BUY Alert", desc)
-
+async def hook(request: Request):
+    payload = await request.json()
+    msgs = parse_helius(payload)
+    for m in msgs:
+        send_to_discord(m)
     return {"status": "ok"}
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
