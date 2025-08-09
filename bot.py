@@ -1,96 +1,136 @@
-import os, time, json, requests, math
+# bot.py
+import os, json, requests
+from fastapi import FastAPI, Request
 from dotenv import load_dotenv
-from datetime import datetime
 
 load_dotenv()
 WH_WHALE = os.getenv("WH_WHALE")
 WH_WATCH = os.getenv("WH_WATCH")
 THRESH_SOL = float(os.getenv("THRESH_SOL", "500"))
-BIRDEYE = os.getenv("BIRDEYE_API_KEY", "")
 
 WATCHLIST = set()
 if os.path.exists("watchlist.txt"):
     with open("watchlist.txt", "r", encoding="utf-8") as f:
         WATCHLIST = {x.strip() for x in f if x.strip()}
 
-LOGFILE = "alerts.json"
+app = FastAPI()
 
-def log(entry):
+def send_embed(webhook, title, desc, color=5814783):
     try:
-        db = json.load(open(LOGFILE,"r",encoding="utf-8"))
+        requests.post(webhook, json={
+            "username":"WhaleCaster",
+            "embeds":[{"title":title,"description":desc,"color":color}]
+        }, timeout=10)
+    except Exception as e:
+        print("Discord error:", e)
+
+def pct(a,b):
+    try:
+        return round((b-a)/a*100, 2)
     except Exception:
-        db = []
-    db.append(entry)
-    json.dump(db, open(LOGFILE,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
+        return None
 
-def send(webhook, title, desc, color=5814783):
-    requests.post(webhook, json={
-        "username":"WhaleCaster",
-        "embeds":[{"title":title,"description":desc,"color":color}]
-    }, timeout=10)
-
-def emoji_rating(mc_change_15m, liq_usd, is_renounced, is_new_token, vol_mult_5m):
+def rating(liq_usd=None, mc_change_15m=None, vol_mult_5m=None, renounced=None, is_new=None):
     tags = ["🐋"]
-    if mc_change_15m is not None and mc_change_15m >= 10 and liq_usd >= 50000: tags.append("🚀")
+    if mc_change_15m is not None and mc_change_15m >= 10 and (liq_usd or 0) >= 50000: tags.append("🚀")
     if vol_mult_5m is not None and vol_mult_5m >= 3: tags.append("🔥")
-    if (liq_usd is not None and liq_usd < 15000) or (is_new_token and not is_renounced): tags.append("💩")
-    # unique order-preserving
-    seen, out = set(), []
-    for t in tags:
-        if t not in seen: seen.add(t); out.append(t)
+    if (liq_usd is not None and liq_usd < 15000) or (is_new and not renounced): tags.append("💩")
+    # unique
+    out, seen = [], set()
+    for x in tags:
+        if x not in seen: seen.add(x); out.append(x)
     return " ".join(out)
 
-def pct_change(a,b):
-    if a and b: return round((b-a)/a*100,2)
-    return None
+def parse_helius(payload: dict):
+    """
+    Helius Enhanced webhook (type: SWAP)
+    Pokusíme se vytáhnout:
+      - kupující wallet
+      - token mint/symbol (pokud je v logs) – symbol může být None, to nevadí
+      - amount v SOL (kolik SOL šlo ven za nákup)
+      - dex url / solscan url
+    """
+    # defaulty
+    buyer = None
+    token_mint = None
+    symbol = "UNKNOWN"
+    sol_spent = 0.0
 
-# ---- MOCK fetch; v ostré verzi napojíme Helius/Birdeye/Dexscreener ----
-def fetch_trades():
-    # sem přijde polling z API – tady je fake jeden obchod pro demo
-    return [{
-        "wallet":"SoLWalletAddrFAKE123",
-        "token":"TokenAddrFAKE456",
-        "symbol":"DUMPINU",
-        "buy_sol": 777,
-        "holders": 91,
-        "mc_usd": 9999,
-        "liq_usd": 33235,
-        "dex_url":"https://dexscreener.com/solana/xxxxxxxx",
-        "solscan_url":"https://solscan.io/token/xxxxxxxx",
-        "entry_price": 0.0123,
-        "current_price": 0.0117,
-        "mc_change_15m": 8.2,
-        "vol_mult_5m": 2.1,
-        "is_renounced": False,
-        "is_new_token": True,
-        "ts": int(time.time())
-    }]
+    # 1) zdrojová peněženka (většinou první signer)
+    try:
+        buyer = payload["accountData"][0]["account"]["pubkey"]
+    except Exception:
+        pass
 
-def handle(tr):
-    chg = pct_change(tr["entry_price"], tr["current_price"])
-    rating = emoji_rating(tr["mc_change_15m"], tr["liq_usd"], tr["is_renounced"], tr["is_new_token"], tr["vol_mult_5m"])
-    desc = (
-        f"{rating} **Whale BUY Alert**\n"
-        f"**BUY:** {tr['buy_sol']} SOL tokenu `{tr['symbol']}`\n"
-        f"🔗 **Adresa:** [Solscan]({tr['solscan_url']})\n"
-        f"👥 **Holders:** {tr['holders']} | **MC:** ${tr['mc_usd']:,} | **LQ:** ${tr['liq_usd']:,}\n"
-        f"🔥 **DexScreener:** {tr['dex_url']}\n"
-        + (f"📈 **{('+' if chg is not None and chg>=0 else '')}{chg}%** od nákupu" if chg is not None else "")
-    )
+    # 2) swap event – Helius dává parsed swap
+    #   hledáme "nativeInput" nebo "nativeOutput" v lamport (1 SOL = 1e9)
+    try:
+        events = payload.get("events", {})
+        swap = events.get("swap", {})
+        # kolik SOL jsme utratili (nativeInput = SOL -> token)
+        lamports_in  = swap.get("nativeInput", 0) or 0
+        lamports_out = swap.get("nativeOutput", 0) or 0
+        if lamports_in:
+            sol_spent = lamports_in / 1_000_000_000
+        elif lamports_out and lamports_out < 0:  # bezpečnostní fallback
+            sol_spent = abs(lamports_out) / 1_000_000_000
 
-    if tr["wallet"] in WATCHLIST and WH_WATCH:
-        send(WH_WATCH, "Watchlist BUY", desc)
-    if tr["buy_sol"] >= THRESH_SOL and WH_WHALE:
-        send(WH_WHALE, "Whale BUY Alert", desc)
+        # cílový token mint
+        token_mint = (swap.get("tokenOutput", {}) or {}).get("mint")
+        if not token_mint:
+            token_mint = (swap.get("tokenInput", {}) or {}).get("mint")
 
-    log({"wallet":tr["wallet"],"token":tr["token"],"buy_sol":tr["buy_sol"],"ts":tr["ts"]})
+    except Exception as e:
+        print("parse swap err:", e)
 
-def main():
-    print("WhaleCaster 24/7 running…")
-    while True:
-        for tr in fetch_trades():
-            handle(tr)
-        time.sleep(5)
+    # Dex/Solscan odkazy
+    dex_url = f"https://dexscreener.com/solana/{token_mint}" if token_mint else "https://dexscreener.com/solana"
+    solscan_url = f"https://solscan.io/token/{token_mint}" if token_mint else "https://solscan.io/tx/"+payload.get("signature","")
 
-if __name__ == "__main__":
-    main()
+    return buyer, token_mint, symbol, sol_spent, dex_url, solscan_url
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.post("/hook")
+async def hook(req: Request):
+    body = await req.json()
+    # Helius umí poslat pole transakcí – pro jistotu bereme všechny
+    items = body if isinstance(body, list) else [body]
+
+    for tx in items:
+        # filtrujeme jen SWAP
+        if tx.get("type") != "SWAP":
+            continue
+
+        buyer, mint, symbol, sol_spent, dex_url, solscan_url = parse_helius(tx)
+        if not buyer or sol_spent <= 0:
+            continue
+
+        # prah pro whale channel
+        is_whale = sol_spent >= THRESH_SOL
+        is_watch = buyer in WATCHLIST
+
+        # (volitelně sem doplníme lookup holders/MC/LQ přes jiné API; teď placeholders)
+        holders = "?"
+        mc_usd  = "?"
+        lq_usd  = "?"
+
+        # rating (zatím bez market dat)
+        tags = rating()
+
+        desc = (
+            f"{tags} **Whale BUY Alert**\n"
+            f"**BUY:** {round(sol_spent,2)} SOL tokenu `{symbol}`\n"
+            f"🔗 **Adresa:** [Solscan]({solscan_url})\n"
+            f"👥 **Holders:** {holders} | **MC:** ${mc_usd} | **LQ:** ${lq_usd}\n"
+            f"🔥 **DexScreener:** {dex_url}\n"
+        )
+
+        if is_watch and WH_WATCH:
+            send_embed(WH_WATCH, "Watchlist BUY", desc)
+        if is_whale and WH_WHALE:
+            send_embed(WH_WHALE, "Whale BUY Alert", desc)
+
+    return {"status": "ok"}
